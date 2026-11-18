@@ -1,0 +1,58 @@
+import '@lobehub/ui';
+
+import { type IEditor } from '@lobehub/editor';
+
+import { type ChatInputEditor } from '@/features/ChatInput';
+
+import { type SPAServerConfig } from './spaServerConfig';
+
+declare global {
+  interface Window {
+    __DEBUG_PROXY__: boolean | undefined;
+    __editor?: IEditor;
+    __LOBE_BOOT_T_HTML__?: number;
+    /**
+     * Zustand store snapshots via `getState()` keyed by store name. Registered in dev, and in
+     * Desktop builds while remote debugging is on (`lobeEnv.exposeStores`).
+     */
+    __LOBE_STORES?: Record<string, () => unknown>;
+    /** Chat input editor of the main composer, mounted by MainChatInput while it is on screen */
+    __mainEditor?: ChatInputEditor;
+    __SERVER_CONFIG__: SPAServerConfig | undefined;
+    lobeEnv?: {
+      chromeVersion?: string;
+      darwinMajorVersion?: number;
+      electronVersion?: string;
+      /** Desktop remote debugging (CDP) is on, so stores register on `window.__LOBE_STORES` */
+      exposeStores?: boolean;
+      isMacTahoe?: boolean;
+      nodeVersion?: string;
+      platform?: NodeJS.Platform;
+      systemLanguage?: string;
+    };
+  }
+
+  /** Vite define: running in CI environment (e.g. CI=true) */
+  const __CI__: boolean;
+
+  /** Vite define: development mode (NODE_ENV !== 'production') */
+  const __DEV__: boolean;
+
+  /** Vite define: running under Vitest */
+  const __TEST__: boolean;
+
+  /** Vite define: renderer built against react-dom/profiling (LOBE_REACT_PROFILING=1) */
+  const __REACT_PROFILING__: boolean;
+
+  /** Vite define: enable react-scan diagnostic runtime */
+  const __REACT_SCAN__: boolean;
+
+  /** Vite define: current bundle is mobile variant */
+  const __MOBILE__: boolean;
+
+  /** Vite define: current bundle is Electron desktop variant */
+  const __ELECTRON__: boolean | undefined;
+
+  /** Vite define: desktop app version injected by the desktop renderer Vite build */
+  const __MAIN_VERSION__: string;
+}

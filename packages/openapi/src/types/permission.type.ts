@@ -1,0 +1,86 @@
+import { z } from 'zod';
+
+import type { PublicPermission } from '../helpers/public-fields';
+import type { IPaginationQuery, PaginationQueryResponse } from './common.type';
+import { dateTimeSchema, PaginationQuerySchema } from './common.type';
+
+// ==================== Permission Query Types ====================
+
+/**
+ * Permission list query parameters
+ */
+export type PermissionsListQuery = IPaginationQuery & {
+  active?: boolean;
+  category?: string;
+};
+
+export const PermissionsListQuerySchema = z
+  .object({
+    active: z
+      .string()
+      .transform((val) => val === 'true')
+      .pipe(z.boolean())
+      .nullish(),
+    category: z.string().min(1).nullish(),
+  })
+  .extend(PaginationQuerySchema.shape);
+
+export type PermissionsListResponse = PaginationQueryResponse<{
+  permissions: PublicPermission[];
+}>;
+
+// ==================== Permission CRUD Types ====================
+
+/**
+ * Create permission request body
+ */
+export type CreatePermissionRequest = {
+  category: string;
+  code: string;
+  description?: string | null;
+  isActive?: boolean;
+  name: string;
+};
+
+export const CreatePermissionRequestSchema = z.object({
+  category: z.string().min(1, 'Category is required'),
+  code: z.string().min(1, 'Permission code is required'),
+  description: z.string().nullish(),
+  isActive: z.boolean().nullish().default(true),
+  name: z.string().min(1, 'Permission name is required'),
+});
+
+/**
+ * Update permission request body
+ */
+export type UpdatePermissionRequest = Partial<CreatePermissionRequest>;
+
+export const UpdatePermissionRequestSchema = CreatePermissionRequestSchema.partial();
+
+// ==================== Common Schemas ====================
+
+export const PermissionIdParamSchema = z.object({
+  id: z.string().length(16, 'Permission ID must be 16 characters'),
+});
+
+// ==================== Response Schemas ====================
+
+/** `PUBLIC_PERMISSION_FIELDS` projection of an `rbac_permissions` row. */
+export const PermissionSchema = z
+  .object({
+    category: z.string(),
+    code: z.string(),
+    createdAt: dateTimeSchema,
+    description: z.string().nullable(),
+    id: z.string(),
+    isActive: z.boolean(),
+    name: z.string(),
+    updatedAt: dateTimeSchema,
+  })
+  .strict()
+  .meta({ id: 'Permission' });
+
+export const PermissionListSchema = z
+  .object({ permissions: z.array(PermissionSchema), total: z.number().int().min(0) })
+  .strict()
+  .meta({ id: 'PermissionList' });

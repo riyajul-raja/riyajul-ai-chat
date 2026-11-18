@@ -1,0 +1,246 @@
+import { IssuerMismatchError } from '@modelcontextprotocol/client';
+import debug from 'debug';
+import { type NextRequest, NextResponse } from 'next/server';
+
+import { ConnectorModel } from '@/database/models/connector';
+import { ConnectorLinkModel } from '@/database/models/connectorLink';
+import { ConnectorToolModel } from '@/database/models/connectorTool';
+import { serverDB } from '@/database/server';
+import { appEnv } from '@/envs/app';
+import { KeyVaultsGateKeeper } from '@/server/modules/KeyVaultsEncrypt';
+import { resolveLinkIdentity } from '@/server/services/connector/identity';
+import {
+  discoverConnectorAuthorizationServerMetadata,
+  exchangeConnectorCode,
+  toClientInformation,
+} from '@/server/services/connector/oauth';
+import {
+  consumeConnectorOAuthState,
+  saveConnectorOAuthCompletion,
+} from '@/server/services/connector/stateStore';
+import { syncConnectorToolsById } from '@/server/services/connector/sync';
+import { tokensToCredentials } from '@/server/services/connector/tokens';
+import { scheduleRefreshByConnector } from '@/server/services/inboundWebhook/lifecycle';
+
+const log = debug('lobe-server:connector:oauth-callback');
+
+/** Origin allowed to receive the postMessage result (the app itself). */
+const targetOrigin = (): string => {
+  try {
+    return appEnv.APP_URL ? new URL(appEnv.APP_URL).origin : '*';
+  } catch {
+    return '*';
+  }
+};
+
+/**
+ * Serialize a value for safe embedding inside an inline `<script>`. Plain
+ * JSON.stringify does NOT escape `</script>` or the U+2028/U+2029 line
+ * separators, so an attacker-controlled OAuth error string could break out of
+ * the script context and execute on the app origin. Escaping `<`, `>`, `&` and
+ * the JS line separators to their `\uXXXX` form closes that hole.
+ */
+const jsonForScript = (value: unknown): string =>
+  JSON.stringify(value).replaceAll(
+    /[<>&\u2028\u2029]/g,
+    (c) => '\\u' + c.codePointAt(0)!.toString(16).padStart(4, '0'),
+  );
+
+const escapeHtml = (value: string): string =>
+  value.replaceAll(
+    /[&<>"']/g,
+    (c) => ({ '"': '&quot;', '&': '&amp;', "'": '&#39;', '<': '&lt;', '>': '&gt;' })[c]!,
+  );
+
+/**
+ * Popup page that reports the result back to the opener window. Success closes
+ * itself; failure stays open with the reason, because providers whose COOP
+ * policy severs `window.opener` leave the page as the only place to see it.
+ */
+const renderResultPage = (result: {
+  connectorId?: string;
+  error?: string;
+  success: boolean;
+  /** Whether the tool list synced. `false` = authorized but tools unavailable. */
+  synced?: boolean;
+  linkId?: string;
+  outcome?: 'created' | 'reauthorized' | 'matchedExisting';
+}): NextResponse => {
+  const payload = jsonForScript({ type: 'lobe-connector-oauth', ...result });
+  const html = `<!doctype html>
+<html>
+  <head><meta charset="utf-8" /><title>Connector authorization</title></head>
+  <body style="font-family: system-ui, sans-serif; padding: 24px; text-align: center;">
+    <p>${result.success ? 'Authorization complete. You can close this window.' : 'Authorization failed.'}</p>
+    ${result.error ? `<p style="color: #888; font-size: 13px; word-break: break-word;">${escapeHtml(result.error)}</p>` : ''}
+    <script>
+      (function () {
+        try {
+          // The isolated desktop preload relays status to the native window
+          // owner even when a provider's COOP policy severs window.opener.
+          window.postMessage(${payload}, window.location.origin);
+          if (window.opener) {
+            window.opener.postMessage(${payload}, ${jsonForScript(targetOrigin())});
+          }
+        } catch (e) {}
+        ${result.success ? 'setTimeout(function () { window.close(); }, 300);' : ''}
+      })();
+    </script>
+  </body>
+</html>`;
+  return new NextResponse(html, {
+    headers: { 'content-type': 'text/html; charset=utf-8' },
+  });
+};
+
+const renderFailure = (error: string, cause?: unknown): NextResponse => {
+  console.error('[connector OAuth callback] failed: %s', error, cause ?? '');
+  return renderResultPage({ error, success: false });
+};
+
+export const GET = async (req: NextRequest) => {
+  const searchParams = req.nextUrl.searchParams;
+  const code = searchParams.get('code');
+  const state = searchParams.get('state');
+  const iss = searchParams.get('iss') ?? undefined;
+  const oauthError = searchParams.get('error');
+
+  if (oauthError) {
+    const description = searchParams.get('error_description');
+    return renderFailure(description ? `${oauthError}: ${description}` : oauthError);
+  }
+
+  if (!code || !state) {
+    return renderFailure('missing_code_or_state');
+  }
+
+  try {
+    const payload = await consumeConnectorOAuthState(state);
+    if (!payload) {
+      return renderFailure('invalid_or_expired_state');
+    }
+
+    const gateKeeper = await KeyVaultsGateKeeper.initWithEnvKey();
+    // Same scope the connector was created in; otherwise a workspace connector
+    // is looked up as a personal one and never found.
+    const connectorModel = new ConnectorModel(
+      serverDB,
+      payload.lobeUserId,
+      payload.workspaceId,
+      gateKeeper,
+    );
+
+    const connector = await connectorModel.findById(payload.connectorId);
+    if (!connector) {
+      return renderFailure('connector_not_found');
+    }
+
+    const oidc = connector.oidcConfig;
+    if (!oidc?.clientId) {
+      return renderFailure('connector_missing_client');
+    }
+
+    const metadata = await discoverConnectorAuthorizationServerMetadata(
+      payload.authorizationServerUrl,
+    );
+    if (!metadata) {
+      return renderFailure('metadata_discovery_failed');
+    }
+
+    const { authMethod, tokens } = await exchangeConnectorCode({
+      authorizationCode: code,
+      authorizationServerUrl: payload.authorizationServerUrl,
+      clientInformation: toClientInformation(oidc),
+      codeVerifier: payload.codeVerifier,
+      iss,
+      metadata,
+      redirectUri: oidc.redirectUri!,
+      resource: connector.mcpServerUrl ?? undefined,
+    });
+
+    const { credentials } = tokensToCredentials(tokens, {
+      clientSecret: oidc.clientSecret,
+    });
+
+    if (authMethod)
+      await connectorModel.update(payload.connectorId, {
+        oidcConfig: { ...oidc, tokenEndpointAuthMethod: authMethod },
+      });
+    const connectorLinkModel = new ConnectorLinkModel(
+      serverDB,
+      payload.lobeUserId,
+      payload.workspaceId,
+      gateKeeper,
+    );
+    if (credentials.type !== 'oauth2') return renderFailure('invalid_credentials');
+    const earliestLink = payload.linkTarget
+      ? undefined
+      : (await connectorLinkModel.listByConnectorIds([payload.connectorId]))[0];
+    const authorization = await connectorLinkModel.applyAuthorization(payload.connectorId, {
+      target:
+        payload.linkTarget ??
+        (earliestLink ? { kind: 'existing', linkId: earliestLink.id } : { kind: 'new' }),
+      identity: await resolveLinkIdentity({ tokens, metadata }),
+      credentials,
+      authorizerId: payload.lobeUserId,
+    });
+
+    // Sync the tool list server-side so the connector is immediately usable —
+    // no dependency on the popup/postMessage round-trip. This also sets the
+    // connector status (connected on success, error on failure).
+    const connectorToolModel = new ConnectorToolModel(
+      serverDB,
+      payload.lobeUserId,
+      payload.workspaceId,
+    );
+    let synced = false;
+    try {
+      const { toolCount } = await syncConnectorToolsById(
+        payload.connectorId,
+        {
+          connectorModel,
+          connectorLinkModel,
+          connectorToolModel,
+          // A connector set to connect through the device lists on the user's device
+          serverDB,
+          userId: payload.lobeUserId,
+        },
+        { linkId: authorization.linkId },
+      );
+      synced = true;
+      log('connector %s authorized + synced %d tools', payload.connectorId, toolCount);
+    } catch (err) {
+      // Auth succeeded but the tool list could not be fetched; the user can
+      // retry via the Sync button. Report success (auth is valid) but flag the
+      // missing sync so the UI doesn't claim a fully-working connector.
+      log('post-OAuth tool sync failed for connector=%s: %O', payload.connectorId, err);
+    }
+
+    // Only a fallback for a window that misses the result below: the account
+    // is stored, so failing to record how the flow ended must not fail it.
+    await saveConnectorOAuthCompletion(state, {
+      connectorId: payload.connectorId,
+      lobeUserId: payload.lobeUserId,
+      workspaceId: payload.workspaceId,
+      ...authorization,
+    }).catch((err) => {
+      log('recording the OAuth completion of connector=%s failed: %O', payload.connectorId, err);
+    });
+    // After the response: the popup must not wait on renewing this connector's subscriptions.
+    scheduleRefreshByConnector(
+      serverDB,
+      { userId: payload.lobeUserId, workspaceId: payload.workspaceId },
+      payload.connectorId,
+    );
+    return renderResultPage({
+      connectorId: payload.connectorId,
+      success: true,
+      synced,
+      ...authorization,
+    });
+  } catch (err) {
+    if (IssuerMismatchError.isInstance(err)) return renderFailure('issuer_mismatch', err);
+    const message = err instanceof Error ? err.message : 'internal_error';
+    return renderFailure(message, err);
+  }
+};

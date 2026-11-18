@@ -1,0 +1,78 @@
+import { type UIChatMessage } from '@lobechat/types';
+import { Button, copyToClipboard, Flexbox, toast } from '@lobehub/ui';
+import * as stylex from '@stylexjs/stylex';
+import isEqual from 'fast-deep-equal';
+import { CopyIcon } from 'lucide-react';
+import { memo } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { useIsMobile } from '@/hooks/useIsMobile';
+import { useChatStore } from '@/store/chat';
+import { topicSelectors } from '@/store/chat/selectors';
+import { exportFile } from '@/utils/client';
+
+import { styles } from '../style';
+import Preview from './Preview';
+import { generateMarkdown } from './template';
+
+interface ShareTextProps {
+  item: UIChatMessage;
+}
+
+const ShareText = memo<ShareTextProps>(({ item }) => {
+  const { t } = useTranslation(['chat', 'common']);
+
+  const messages = [item];
+  const topic = useChatStore(topicSelectors.currentActiveTopic, isEqual);
+
+  const title = topic?.title || t('shareModal.exportTitle');
+  const content = generateMarkdown({
+    messages,
+  }).replaceAll('\n\n\n', '\n');
+
+  const isMobile = useIsMobile();
+
+  const button = (
+    <>
+      <Button
+        block
+        icon={CopyIcon}
+        size={isMobile ? undefined : 'large'}
+        type={'primary'}
+        onClick={async () => {
+          await copyToClipboard(content);
+          toast.success(t('copySuccess', { ns: 'common' }));
+        }}
+      >
+        {t('copy', { ns: 'common' })}
+      </Button>
+      <Button
+        block
+        size={isMobile ? undefined : 'large'}
+        onClick={() => {
+          exportFile(content, `${title}.md`);
+        }}
+      >
+        {t('shareModal.downloadFile')}
+      </Button>
+    </>
+  );
+
+  return (
+    <>
+      <Flexbox className={stylex.props(styles.body).className} gap={16} horizontal={!isMobile}>
+        <Preview content={content} />
+        <Flexbox className={stylex.props(styles.sidebar).className} gap={12}>
+          {!isMobile && button}
+        </Flexbox>
+      </Flexbox>
+      {isMobile && (
+        <Flexbox horizontal className={stylex.props(styles.footer).className} gap={8}>
+          {button}
+        </Flexbox>
+      )}
+    </>
+  );
+});
+
+export default ShareText;

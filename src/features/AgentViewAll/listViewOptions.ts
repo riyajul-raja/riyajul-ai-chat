@@ -1,0 +1,49 @@
+export type AgentGroupBy = 'author' | 'folder' | 'label' | 'none';
+export type AgentOrderBy = 'author' | 'title' | 'updatedAt';
+export type AgentOrderDirection = 'asc' | 'desc';
+
+export interface AgentListViewOptions {
+  groupBy: AgentGroupBy;
+  orderBy: AgentOrderBy;
+  orderDirection: AgentOrderDirection;
+  /** Whether agents hidden from the sidebar still appear on this page. */
+  showSidebarHidden: boolean;
+}
+
+export const DEFAULT_AGENT_LIST_VIEW_OPTIONS: AgentListViewOptions = {
+  groupBy: 'none',
+  orderBy: 'updatedAt',
+  orderDirection: 'desc',
+  showSidebarHidden: true,
+};
+
+const AGENT_GROUP_BY_SET = new Set<AgentGroupBy>(['author', 'folder', 'label', 'none']);
+const AGENT_ORDER_BY_SET = new Set<AgentOrderBy>(['author', 'title', 'updatedAt']);
+const AGENT_ORDER_DIRECTION_SET = new Set<AgentOrderDirection>(['asc', 'desc']);
+
+/**
+ * @param defaultGroupBy - grouping used until the member picks one. A
+ *   workspace browses its shared folders here (its sidebar lists only pinned
+ *   ones), so it opens grouped by folder; personal mode keeps a flat list.
+ */
+export const normalizeAgentListViewOptions = (
+  value?: Partial<AgentListViewOptions> | null,
+  defaultGroupBy: AgentGroupBy = DEFAULT_AGENT_LIST_VIEW_OPTIONS.groupBy,
+): AgentListViewOptions => {
+  const next = value ?? {};
+  return {
+    groupBy: AGENT_GROUP_BY_SET.has(next.groupBy as AgentGroupBy)
+      ? (next.groupBy as AgentGroupBy)
+      : defaultGroupBy,
+    orderBy: AGENT_ORDER_BY_SET.has(next.orderBy as AgentOrderBy)
+      ? (next.orderBy as AgentOrderBy)
+      : DEFAULT_AGENT_LIST_VIEW_OPTIONS.orderBy,
+    orderDirection: AGENT_ORDER_DIRECTION_SET.has(next.orderDirection as AgentOrderDirection)
+      ? (next.orderDirection as AgentOrderDirection)
+      : DEFAULT_AGENT_LIST_VIEW_OPTIONS.orderDirection,
+    showSidebarHidden:
+      typeof next.showSidebarHidden === 'boolean'
+        ? next.showSidebarHidden
+        : DEFAULT_AGENT_LIST_VIEW_OPTIONS.showSidebarHidden,
+  };
+};

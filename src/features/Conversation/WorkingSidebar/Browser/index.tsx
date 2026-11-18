@@ -1,0 +1,468 @@
+import { isDesktop } from '@lobechat/const';
+import { nanoid } from '@lobechat/utils';
+import { ActionIcon, Button, Center, Empty, Flexbox, Icon, Input, Text, toast } from '@lobehub/ui';
+import { cssVar } from '@lobehub/ui/stylex/cssVar.stylex';
+import * as stylex from '@stylexjs/stylex';
+import {
+  Camera,
+  ChevronLeft,
+  ChevronRight,
+  ExternalLink,
+  Globe,
+  Import,
+  RefreshCw,
+  SquareDashedMousePointer,
+  XCircle,
+} from 'lucide-react';
+import { memo, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { BrowserIcon } from '@/components/BrowserIcon';
+import { DESKTOP_HEADER_ICON_SMALL_SIZE } from '@/const/layoutTokens';
+import { useLocalStorageState } from '@/hooks/useLocalStorageState';
+import { electronBrowserSidebarService } from '@/services/electron/browserSidebar';
+import { browserWebviewRegistry } from '@/services/electron/browserWebviewRegistry';
+import { useChatStore } from '@/store/chat';
+import { useFileStore } from '@/store/file';
+import { useGlobalStore } from '@/store/global';
+
+import type { ComposerTarget } from '../../types';
+import { BROWSER_IMPORT_BANNER_DISMISSED_STORAGE_KEY } from './const';
+import { useBrowserSidebarState } from './useBrowserSidebarState';
+import {
+  buildScreenshotFileName,
+  createElementContext,
+  dataUrlToFile,
+  normalizeBrowserUrl,
+} from './utils';
+
+const REDUCED_MOTION = '@media (prefers-reduced-motion: reduce)';
+const NARROW_BANNER = '@container (max-width: 480px)';
+
+const loadingProgress = stylex.keyframes({
+  from: { transform: 'translateX(-110%)' },
+  to: { transform: 'translateX(310%)' },
+});
+
+const styles = stylex.create({
+  loadingBar: {
+    'pointerEvents': 'none',
+    'position': 'absolute',
+    'zIndex': 3,
+    // Anchored to the toolbar's bottom border.
+    'insetBlockEnd': '-1px',
+    'insetInline': 0,
+    'overflow': 'hidden',
+    'height': '2px',
+    '::after': {
+      content: '""',
+      position: 'absolute',
+      insetBlock: 0,
+      insetInlineStart: 0,
+      width: { default: '36%', [REDUCED_MOTION]: '100%' },
+      backgroundColor: cssVar.colorInfo,
+      backgroundImage: 'none',
+      animationName: { default: loadingProgress, [REDUCED_MOTION]: 'none' },
+      animationDuration: { default: '1.15s', [REDUCED_MOTION]: '0s' },
+      animationTimingFunction: { default: 'ease-in-out', [REDUCED_MOTION]: 'ease' },
+      animationIterationCount: { default: 'infinite', [REDUCED_MOTION]: 1 },
+    },
+  },
+  container: {
+    position: 'relative',
+    overflow: 'hidden',
+    flex: '1',
+    width: '100%',
+    minHeight: 0,
+    backgroundColor: cssVar.colorBgContainer,
+    backgroundImage: 'none',
+  },
+  toolbar: {
+    position: 'relative',
+    flexShrink: 0,
+    minHeight: '56px',
+    paddingInline: '16px',
+    borderBlockEndWidth: '1px',
+    borderBlockEndStyle: 'solid',
+    borderBlockEndColor: cssVar.colorBorderSecondary,
+  },
+  address: {
+    flex: '1',
+    minWidth: 0,
+    maxWidth: '720px',
+    // The filled variant keeps its tinted fill while focused; lift it to the
+    // container surface so the focus ring reads as an editable field.
+    backgroundColor: { 'default': null, ':focus': cssVar.colorBgContainer },
+    backgroundImage: { 'default': null, ':focus': 'none' },
+  },
+  importBanner: {
+    containerType: 'inline-size',
+    flexShrink: 0,
+    flexWrap: 'wrap',
+    minHeight: '72px',
+    paddingBlock: '12px',
+    paddingInline: '16px',
+    borderBlockEndWidth: '1px',
+    borderBlockEndStyle: 'solid',
+    borderBlockEndColor: cssVar.colorBorderSecondary,
+    backgroundColor: cssVar.colorBgContainer,
+    backgroundImage: 'none',
+  },
+  importCopy: { flex: '1', minWidth: 0 },
+  importActions: {
+    flexBasis: { default: null, [NARROW_BANNER]: '100%' },
+    justifyContent: { default: null, [NARROW_BANNER]: 'flex-end' },
+    marginInlineStart: { default: 'auto', [NARROW_BANNER]: '44px' },
+  },
+  toolbarActions: { marginInlineStart: 'auto' },
+  // The retained Electron webview is imperatively attached inside this host.
+  viewport: { position: 'absolute', insetBlock: 0, insetInline: 0 },
+});
+
+interface BrowserPaneProps {
+  /** The conversation the chat input belongs to — screenshots are attached there. */
+  agentId?: string;
+  composerTarget: ComposerTarget;
+  onMetadataChange?: (metadata: { faviconUrl?: string; title: string; url: string }) => void;
+  /**
+   * A host that owns its own open requests (the Portal) passes them here and retires
+   * them in `onRequestConsumed`. Without it the pane follows the working sidebar's
+   * global request.
+   */
+  onRequestConsumed?: () => void;
+  request?: BrowserOpenRequest | null;
+  sessionId: string;
+}
+
+export interface BrowserOpenRequest {
+  nonce: number;
+  url: string;
+}
+
+const BrowserPane = memo<BrowserPaneProps>((props) => {
+  const { agentId, composerTarget, onMetadataChange, onRequestConsumed, sessionId } = props;
+  const { t } = useTranslation('chat');
+  const state = useBrowserSidebarState(sessionId);
+  const [address, setAddress] = useState('');
+  const [isEditing, setIsEditing] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [isPicking, setIsPicking] = useState(false);
+  const [isImportBannerDismissed, setIsImportBannerDismissed] = useLocalStorageState(
+    BROWSER_IMPORT_BANNER_DISMISSED_STORAGE_KEY,
+    false,
+  );
+  const globalRequest = useGlobalStore((s) => s.status.workingSidebarBrowserRequest);
+  const clearBrowserTabRequest = useGlobalStore((s) => s.clearBrowserTabRequest);
+  const ownsRequest = props.request !== undefined;
+  const browserRequest = ownsRequest ? props.request : globalRequest;
+  const consumedNonce = useRef<number>(undefined);
+  const viewportRef = useRef<HTMLDivElement>(null);
+
+  // Metadata comes from the main-process controller registered to this guest.
+  useEffect(() => {
+    onMetadataChange?.({ faviconUrl: state.faviconUrl, title: state.title, url: state.url });
+  }, [onMetadataChange, state.faviconUrl, state.title, state.url]);
+
+  // The automation overlay is drawn inside the guest page — hand the copy over.
+  useEffect(() => {
+    if (!isDesktop) return;
+    void electronBrowserSidebarService.setOverlayLabels({
+      controlling: t('workingPanel.browser.agentControlling'),
+      cursor: t('workingPanel.browser.agentCursor'),
+    });
+  }, [t]);
+
+  // The guest stays alive in a hidden renderer host when this pane unmounts.
+  // Moving the same DOM node into this viewport keeps its browsing context while
+  // allowing ordinary React portals to paint above it.
+  useEffect(() => {
+    const host = viewportRef.current;
+    if (!isDesktop || !host) return;
+    void browserWebviewRegistry.attach(sessionId, host).catch((error) => {
+      console.error('[BrowserSidebar] Failed to attach browser webview:', error);
+    });
+
+    return () => {
+      void browserWebviewRegistry.detach(sessionId, host).catch((error) => {
+        console.error('[BrowserSidebar] Failed to retain browser webview:', error);
+      });
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!isEditing) setAddress(state.url === 'about:blank' ? '' : state.url);
+  }, [isEditing, state.url]);
+
+  const runAction = async (action: () => Promise<{ error?: string; success: boolean }>) => {
+    try {
+      const result = await action();
+      if (!result.success) {
+        toast.error(result.error || t('workingPanel.browser.actions.failed'));
+      }
+    } catch (error) {
+      console.error('[BrowserSidebar] Browser action failed:', error);
+      toast.error(t('workingPanel.browser.actions.failed'));
+    }
+  };
+
+  const openUrl = (rawUrl: string) => {
+    const url = normalizeBrowserUrl(rawUrl);
+    setAddress(url);
+    void runAction(() => electronBrowserSidebarService.navigate({ sessionId, url }));
+  };
+
+  const focusChatInput = () => {
+    window.setTimeout(() => useChatStore.getState().mainInputEditor?.focus(), 160);
+  };
+
+  const addScreenshotToInput = async () => {
+    if (isCapturing || !agentId || !composerTarget.writable) return;
+    const { contextKey } = composerTarget;
+    setIsCapturing(true);
+    try {
+      const result = await electronBrowserSidebarService.captureScreenshot({ sessionId });
+      if (!result.success || !result.dataUrl) {
+        toast.error(result.error || t('workingPanel.browser.actions.failed'));
+        return;
+      }
+
+      const file = dataUrlToFile(result.dataUrl, buildScreenshotFileName(result.title));
+      // The attachment appears in the input immediately (pending state); the
+      // upload itself reports its own progress and errors.
+      void useFileStore.getState().uploadChatFiles(contextKey, [file], agentId);
+      toast.success(t('workingPanel.browser.actions.captured'));
+      focusChatInput();
+    } catch (error) {
+      console.error('[BrowserSidebar] Failed to capture screenshot:', error);
+      toast.error(t('workingPanel.browser.actions.failed'));
+    } finally {
+      setIsCapturing(false);
+    }
+  };
+
+  const pickElementContext = async () => {
+    if (!composerTarget.writable) return;
+
+    setIsPicking(true);
+    try {
+      const result = await electronBrowserSidebarService.pickElement({
+        hint: t('workingPanel.browser.context.pickHint'),
+        sessionId,
+      });
+      if (!result.success) {
+        toast.error(result.error || t('workingPanel.browser.context.failed'));
+        return;
+      }
+      if (result.cancelled || !result.element) return;
+
+      useFileStore.getState().addChatContextSelection({
+        contextKey: composerTarget.contextKey,
+        selection: createElementContext({
+          element: result.element,
+          elementTitle: t('workingPanel.browser.context.elementTitle'),
+          id: `browser-element-${nanoid(6)}`,
+        }),
+      });
+      toast.success(t('workingPanel.browser.context.elementAdded'));
+      focusChatInput();
+    } catch (error) {
+      console.error('[BrowserSidebar] Failed to pick element:', error);
+      toast.error(t('workingPanel.browser.context.failed'));
+    } finally {
+      setIsPicking(false);
+    }
+  };
+
+  // A pick left running when the pane unmounts (topic switch, tab change) would
+  // leave the page swallowing every click — tear it down with the pane.
+  useEffect(() => {
+    if (!isDesktop) return;
+    return () => {
+      void electronBrowserSidebarService.cancelElementPick({ sessionId }).catch(() => {});
+    };
+  }, [sessionId]);
+
+  const handleImportChromeLoginData = async () => {
+    setIsImporting(true);
+    try {
+      const result = await electronBrowserSidebarService.importChromeLoginData();
+      if (!result.success) {
+        toast.error(t('workingPanel.browser.import.failed'));
+        return;
+      }
+
+      toast.success(t('workingPanel.browser.import.success', { count: result.importedCount }));
+      setIsImportBannerDismissed(true);
+      if (state.attached) {
+        void runAction(() => electronBrowserSidebarService.reload({ sessionId }));
+      }
+    } catch (error) {
+      console.error('[BrowserSidebar] Failed to import Chrome login information:', error);
+      toast.error(t('workingPanel.browser.import.failed'));
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  // External open requests (web-browsing search results, store action) arrive as
+  // one-shot nonces; the pane may mount after the request was fired, so consume
+  // whatever is pending on mount too.
+  //
+  // Retiring the request in the store is what makes it truly one-shot. The nonce
+  // ref alone cannot: it dies with the component, and the pane is remounted on
+  // every topic switch (the browser session key is per-topic). A request left in
+  // persisted status would then be re-consumed on each switch and would navigate
+  // that topic's page away from whatever the agent had loaded there.
+  useEffect(() => {
+    if (!browserRequest || consumedNonce.current === browserRequest.nonce) return;
+    consumedNonce.current = browserRequest.nonce;
+    openUrl(browserRequest.url);
+    if (ownsRequest) onRequestConsumed?.();
+    else clearBrowserTabRequest();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [browserRequest?.nonce]);
+
+  if (!isDesktop)
+    return (
+      <Center height={'100%'} width={'100%'}>
+        <Empty description={t('workingPanel.browser.desktopOnly')} icon={Globe} />
+      </Center>
+    );
+
+  return (
+    <Flexbox height={'100%'} width={'100%'}>
+      <Flexbox horizontal align={'center'} {...stylex.props(styles.toolbar)} gap={4}>
+        <Flexbox horizontal align={'center'} gap={4}>
+          <ActionIcon
+            disabled={!state.canGoBack}
+            icon={ChevronLeft}
+            size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+            title={t('workingPanel.browser.actions.back')}
+            onClick={() => runAction(() => electronBrowserSidebarService.goBack({ sessionId }))}
+          />
+          <ActionIcon
+            disabled={!state.canGoForward}
+            icon={ChevronRight}
+            size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+            title={t('workingPanel.browser.actions.forward')}
+            onClick={() => runAction(() => electronBrowserSidebarService.goForward({ sessionId }))}
+          />
+          <ActionIcon
+            disabled={!state.attached}
+            icon={state.isLoading ? XCircle : RefreshCw}
+            size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+            title={
+              state.isLoading
+                ? t('workingPanel.browser.actions.stop')
+                : t('workingPanel.browser.actions.reload')
+            }
+            onClick={() =>
+              runAction(() =>
+                state.isLoading
+                  ? electronBrowserSidebarService.stop({ sessionId })
+                  : electronBrowserSidebarService.reload({ sessionId }),
+              )
+            }
+          />
+        </Flexbox>
+        <Input
+          {...stylex.props(styles.address)}
+          placeholder={t('workingPanel.browser.addressPlaceholder')}
+          value={address}
+          variant={'filled'}
+          onBlur={() => setIsEditing(false)}
+          onFocus={() => setIsEditing(true)}
+          onChange={(event) => {
+            setIsEditing(true);
+            setAddress(event.target.value);
+          }}
+          onPressEnter={() => {
+            setIsEditing(false);
+            openUrl(address);
+          }}
+        />
+        <Flexbox horizontal align={'center'} {...stylex.props(styles.toolbarActions)} gap={4}>
+          {isPicking ? (
+            <ActionIcon
+              active
+              icon={SquareDashedMousePointer}
+              size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+              title={t('workingPanel.browser.context.pickCancel')}
+              onClick={() =>
+                void electronBrowserSidebarService.cancelElementPick({ sessionId }).catch(() => {})
+              }
+            />
+          ) : (
+            <ActionIcon
+              disabled={!state.attached || state.isLoading || !composerTarget.writable}
+              icon={SquareDashedMousePointer}
+              size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+              title={t('workingPanel.browser.context.pickElement')}
+              onClick={() => void pickElementContext()}
+            />
+          )}
+          <ActionIcon
+            disabled={!state.attached}
+            icon={ExternalLink}
+            size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+            title={t('workingPanel.browser.actions.openExternal')}
+            onClick={() =>
+              runAction(() => electronBrowserSidebarService.openExternal({ sessionId }))
+            }
+          />
+          <ActionIcon
+            disabled={!state.attached || !agentId || !composerTarget.writable}
+            icon={Camera}
+            loading={isCapturing}
+            size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+            title={t('workingPanel.browser.actions.capture')}
+            onClick={() => void addScreenshotToInput()}
+          />
+        </Flexbox>
+        {/* Sits on the toolbar edge so loading feedback remains stable. */}
+        {state.isLoading && (
+          <div
+            aria-label={t('workingPanel.browser.loading')}
+            aria-valuetext={t('workingPanel.browser.loading')}
+            {...stylex.props(styles.loadingBar)}
+            role="progressbar"
+          />
+        )}
+      </Flexbox>
+      {!isImportBannerDismissed && (
+        <Flexbox horizontal align={'center'} {...stylex.props(styles.importBanner)} gap={12}>
+          <BrowserIcon browser={'Chrome'} size={32} />
+          <Flexbox {...stylex.props(styles.importCopy)} gap={0}>
+            <Text strong>{t('workingPanel.browser.import.title')}</Text>
+            <Text ellipsis type={'secondary'}>
+              {t('workingPanel.browser.import.desc')}
+            </Text>
+          </Flexbox>
+          <Flexbox horizontal align={'center'} {...stylex.props(styles.importActions)} gap={4}>
+            <Button
+              icon={<Icon icon={Import} />}
+              loading={isImporting}
+              onClick={handleImportChromeLoginData}
+            >
+              {t('workingPanel.browser.import.action')}
+            </Button>
+            <ActionIcon
+              icon={XCircle}
+              size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+              title={t('workingPanel.browser.import.dismiss')}
+              onClick={() => setIsImportBannerDismissed(true)}
+            />
+          </Flexbox>
+        </Flexbox>
+      )}
+      <Flexbox {...stylex.props(styles.container)}>
+        <div {...stylex.props(styles.viewport)} ref={viewportRef} />
+      </Flexbox>
+    </Flexbox>
+  );
+});
+
+BrowserPane.displayName = 'BrowserPane';
+
+export default BrowserPane;

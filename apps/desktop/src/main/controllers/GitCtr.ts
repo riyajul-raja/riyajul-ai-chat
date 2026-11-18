@@ -1,0 +1,271 @@
+import type {
+  GetGitBranchDiffPayload,
+  GitAddWorktreeResult,
+  GitAheadBehind,
+  GitBranchDiffPatches,
+  GitBranchInfo,
+  GitBranchListItem,
+  GitCheckoutResult,
+  GitDeleteBranchResult,
+  GitFileRevertResult,
+  GitLinkedPullRequestResult,
+  GitOwnedWorktreeCleanupResult,
+  GitOwnedWorktreeRestoreResult,
+  GitPullRequestAction,
+  GitPullRequestActionResult,
+  GitPullRequestActivity,
+  GitPullRequestDetailResult,
+  GitPullRequestMergeContext,
+  GitPullResult,
+  GitPushResult,
+  GitRemoteBranchListItem,
+  GitRemoveWorktreeResult,
+  GitRenameBranchResult,
+  GitWorkingTreeFiles,
+  GitWorkingTreePatches,
+  GitWorkingTreeStatus,
+  GitWorktreeListItem,
+} from '@lobechat/electron-client-ipc';
+import type { DeviceGitInfo } from '@lobechat/local-file-shell/git';
+
+import { ControllerModule, IpcMethod } from './index';
+
+const loadGit = () => import('@lobechat/local-file-shell/git');
+
+/**
+ * GitController
+ *
+ * Thin IPC layer over `@lobechat/local-file-shell`'s git operations. Every
+ * method delegates to the shared implementation so the local desktop IPC path,
+ * the device-control RPC dispatch, and the CLI all run identical git logic.
+ */
+export default class GitController extends ControllerModule {
+  static override readonly groupName = 'git';
+
+  @IpcMethod()
+  async detectRepoType(dirPath: string): Promise<'git' | 'github' | undefined> {
+    const { detectRepoType } = await loadGit();
+    return detectRepoType(dirPath);
+  }
+
+  @IpcMethod()
+  async getGitBranch(dirPath: string): Promise<GitBranchInfo> {
+    const { getGitBranch: computeGitBranch } = await loadGit();
+    return computeGitBranch(dirPath);
+  }
+
+  @IpcMethod()
+  async gitInfo(params: { isGithub?: boolean; scope: string }): Promise<DeviceGitInfo> {
+    const { gitInfo: computeGitInfo } = await loadGit();
+    return computeGitInfo(params);
+  }
+
+  @IpcMethod()
+  async getLinkedPullRequest(payload: {
+    branch: string;
+    path: string;
+    pullRequestNumber?: number;
+    state?: 'all' | 'open';
+  }): Promise<GitLinkedPullRequestResult> {
+    const { getLinkedPullRequest: computeLinkedPullRequest } = await loadGit();
+    return computeLinkedPullRequest(payload);
+  }
+
+  @IpcMethod()
+  async getPullRequestDetail(payload: {
+    coreOnly?: boolean;
+    number: number;
+    path: string;
+  }): Promise<GitPullRequestDetailResult> {
+    const { getPullRequestDetail: computePullRequestDetail } = await loadGit();
+    return computePullRequestDetail(payload);
+  }
+
+  @IpcMethod()
+  async getPullRequestActivity(payload: {
+    number: number;
+    path: string;
+  }): Promise<GitPullRequestActivity> {
+    const { getPullRequestActivity: computePullRequestActivity } = await loadGit();
+    return computePullRequestActivity(payload);
+  }
+
+  @IpcMethod()
+  async getPullRequestMergeContext(payload: {
+    baseRefName: string;
+    headRefOid: string;
+    number: number;
+    path: string;
+    repo: { name: string; owner: string };
+  }): Promise<GitPullRequestMergeContext> {
+    const { getPullRequestMergeContext: computeMergeContext } = await loadGit();
+    return computeMergeContext(payload);
+  }
+
+  @IpcMethod()
+  async runPullRequestAction(payload: {
+    action: GitPullRequestAction;
+    number: number;
+    path: string;
+    url?: string;
+  }): Promise<GitPullRequestActionResult> {
+    const { runPullRequestAction: runPullRequestActionRpc } = await loadGit();
+    return runPullRequestActionRpc(payload);
+  }
+
+  @IpcMethod()
+  async listGitBranches(dirPath: string): Promise<GitBranchListItem[]> {
+    const { listGitBranches: computeListGitBranches } = await loadGit();
+    return computeListGitBranches(dirPath);
+  }
+
+  @IpcMethod()
+  async listGitRemoteBranches(dirPath: string): Promise<GitRemoteBranchListItem[]> {
+    const { listGitRemoteBranches: computeListGitRemoteBranches } = await loadGit();
+    return computeListGitRemoteBranches(dirPath);
+  }
+
+  @IpcMethod()
+  async listGitWorktrees(dirPath: string): Promise<GitWorktreeListItem[]> {
+    const { listGitWorktrees: computeListGitWorktrees } = await loadGit();
+    return computeListGitWorktrees(dirPath);
+  }
+
+  @IpcMethod()
+  async getGitWorkingTreeStatus(dirPath: string): Promise<GitWorkingTreeStatus> {
+    const { getGitWorkingTreeStatus: computeGitWorkingTreeStatus } = await loadGit();
+    return computeGitWorkingTreeStatus(dirPath);
+  }
+
+  @IpcMethod()
+  async getGitWorkingTreeFiles(dirPath: string): Promise<GitWorkingTreeFiles> {
+    const { getGitWorkingTreeFiles: computeGitWorkingTreeFiles } = await loadGit();
+    // The renderer persists this overlay. A failed or timed-out `git status`
+    // must reject so the cached markers survive, rather than be reported as a
+    // confirmed clean working tree.
+    return computeGitWorkingTreeFiles(dirPath, { throwOnError: true });
+  }
+
+  @IpcMethod()
+  async getGitWorkingTreePatches(dirPath: string): Promise<GitWorkingTreePatches> {
+    const { getGitWorkingTreePatches: computeGitWorkingTreePatches } = await loadGit();
+    return computeGitWorkingTreePatches(dirPath);
+  }
+
+  @IpcMethod()
+  async getGitBranchDiff(payload: GetGitBranchDiffPayload): Promise<GitBranchDiffPatches> {
+    const { getGitBranchDiff: runGitBranchDiff } = await loadGit();
+    return runGitBranchDiff(payload);
+  }
+
+  @IpcMethod()
+  async getGitAheadBehind(
+    payload: string | { branch?: string; path: string },
+  ): Promise<GitAheadBehind> {
+    const { getGitAheadBehind: computeGitAheadBehind } = await loadGit();
+    // Older renderers send the bare path; newer ones may name a branch.
+    if (typeof payload === 'string') return computeGitAheadBehind(payload);
+    return computeGitAheadBehind(payload.path, { branch: payload.branch });
+  }
+
+  @IpcMethod()
+  async checkoutGitBranch(payload: {
+    branch: string;
+    create?: boolean;
+    path: string;
+    startPoint?: string;
+  }): Promise<GitCheckoutResult> {
+    const { checkoutGitBranch: runCheckoutGitBranch } = await loadGit();
+    return runCheckoutGitBranch(payload);
+  }
+
+  @IpcMethod()
+  async renameGitBranch(payload: {
+    from: string;
+    path: string;
+    to: string;
+  }): Promise<GitRenameBranchResult> {
+    const { renameGitBranch: runRenameGitBranch } = await loadGit();
+    return runRenameGitBranch(payload);
+  }
+
+  @IpcMethod()
+  async deleteGitBranch(payload: { branch: string; path: string }): Promise<GitDeleteBranchResult> {
+    const { deleteGitBranch: runDeleteGitBranch } = await loadGit();
+    return runDeleteGitBranch(payload);
+  }
+
+  @IpcMethod()
+  async removeGitWorktree(payload: {
+    path: string;
+    worktreePath: string;
+  }): Promise<GitRemoveWorktreeResult> {
+    const { removeGitWorktree: runRemoveGitWorktree } = await loadGit();
+    return runRemoveGitWorktree(payload);
+  }
+
+  @IpcMethod()
+  async addGitWorktree(payload: {
+    branch: string;
+    ownerToken?: string;
+    path: string;
+    startPoint?: string;
+    worktreePath: string;
+  }): Promise<GitAddWorktreeResult> {
+    const { addGitWorktree: runAddGitWorktree } = await loadGit();
+    return runAddGitWorktree(payload);
+  }
+
+  /**
+   * Remove a worktree the app created for a conversation (archived or trashed),
+   * or with `discard` the one the user chose to drop with its changes. The
+   * guards run in `local-file-shell`; the root is this machine's own.
+   */
+  @IpcMethod()
+  async cleanupOwnedWorktree(payload: {
+    discard?: boolean;
+    ownerToken?: string;
+    sourcePath: string;
+    worktreePath: string;
+  }): Promise<GitOwnedWorktreeCleanupResult> {
+    const { cleanupOwnedWorktree } = await loadGit();
+    const { discard, ownerToken, sourcePath, worktreePath } = payload;
+    return cleanupOwnedWorktree({
+      discard: discard === true,
+      ownerToken,
+      sourcePath,
+      worktreePath,
+    });
+  }
+
+  /** Check a cleaned-up worktree out again at its path, for a restored conversation. */
+  @IpcMethod()
+  async restoreOwnedWorktree(payload: {
+    branch: string;
+    ownerToken?: string;
+    sourcePath: string;
+    worktreePath: string;
+  }): Promise<GitOwnedWorktreeRestoreResult> {
+    const { restoreOwnedWorktree } = await loadGit();
+    const { branch, ownerToken, sourcePath, worktreePath } = payload;
+    return restoreOwnedWorktree({ branch, ownerToken, sourcePath, worktreePath });
+  }
+
+  @IpcMethod()
+  async pullGitBranch(payload: { branch?: string; path: string }): Promise<GitPullResult> {
+    const { pullGitBranch: runPullGitBranch } = await loadGit();
+    return runPullGitBranch(payload);
+  }
+
+  @IpcMethod()
+  async pushGitBranch(payload: { branch?: string; path: string }): Promise<GitPushResult> {
+    const { pushGitBranch: runPushGitBranch } = await loadGit();
+    return runPushGitBranch(payload);
+  }
+
+  @IpcMethod()
+  async revertGitFile(payload: { filePath: string; path: string }): Promise<GitFileRevertResult> {
+    const { revertGitFile: runRevertGitFile } = await loadGit();
+    return runRevertGitFile(payload);
+  }
+}

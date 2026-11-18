@@ -1,0 +1,202 @@
+import { z } from 'zod';
+
+/**
+ * Three-state per-agent plugin config.
+ *
+ * `agents.plugins` (JSONB) stays `AgentPluginEntry[]` at the DB layer — no
+ * schema migration. Legacy rows only ever contain bare identifier strings;
+ * new writes upgrade a touched entry to `AgentPluginConfigItem` in place and
+ * leave every other, untouched entry in its original shape (lazy per-item
+ * upgrade — mixed-shape arrays are a permanent, not transitional, state).
+ */
+export type AgentPluginMode = 'pinned' | 'auto' | 'disabled';
+
+export interface AgentPluginConfigItem {
+  identifier: string;
+  /**
+   * @default 'pinned' — absent on legacy string entries and on object
+   * entries written before this field existed.
+   */
+  mode?: AgentPluginMode;
+}
+
+export type AgentPluginEntry = string | AgentPluginConfigItem;
+
+export const AgentPluginModeSchema = z.enum(['pinned', 'auto', 'disabled']);
+
+/**
+ * Zod schema for a single `plugins[]` entry — for input validation on
+ * routers/procedures that accept a caller-supplied plugins array (e.g. group
+ * member creation). Accepts both the legacy bare string and the tri-state
+ * object shape, so a client can pre-seed a disabled/pinned entry instead of
+ * being rejected by a `z.array(z.string())` schema.
+ */
+export const AgentPluginEntrySchema: z.ZodType<AgentPluginEntry> = z.union([
+  z.string(),
+  z.object({ identifier: z.string(), mode: AgentPluginModeSchema.optional() }),
+]);
+
+/**
+ * Normalizes a single entry: legacy strings and mode-less objects both
+ * resolve to `'pinned'`, matching the pre-existing "present in the array ==
+ * pinned" behavior.
+ */
+export const parsePluginEntry = (
+  entry: AgentPluginEntry,
+): { identifier: string; mode: AgentPluginMode } =>
+  typeof entry === 'string'
+    ? { identifier: entry, mode: 'pinned' }
+    : { identifier: entry.identifier, mode: entry.mode ?? 'pinned' };
+
+/**
+ * Resolves an identifier's mode. An identifier absent from `plugins`
+ * altogether is `'auto'` — the implicit default for anything in the user's
+ * installed/connected pool that the agent hasn't explicitly pinned or
+ * disabled.
+ */
+export const getPluginMode = (
+  plugins: AgentPluginEntry[] | undefined,
+  identifier: string,
+): AgentPluginMode => {
+  const entry = plugins?.find((item) => parsePluginEntry(item).identifier === identifier);
+  return entry ? parsePluginEntry(entry).mode : 'auto';
+};
+
+/**
+ * Library skills — the ones a user installs from the market or authors
+ * themselves — are opt-in per agent. The agent's profile is where one is
+ * turned on, so a library skill the agent has no entry for is `'disabled'`
+ * there, not the implicit `'auto'` every other plugin kind resolves to.
+ * Builtin skills, tools and connectors keep {@link getPluginMode}.
+ */
+export const LIBRARY_SKILL_IMPLICIT_MODE: AgentPluginMode = 'disabled';
+
+/** A library skill's mode for this agent; see {@link LIBRARY_SKILL_IMPLICIT_MODE}. */
+export const getLibrarySkillMode = (
+  plugins: AgentPluginEntry[] | undefined,
+  identifier: string,
+): AgentPluginMode => {
+  const entry = plugins?.find((item) => parsePluginEntry(item).identifier === identifier);
+  return entry ? parsePluginEntry(entry).mode : LIBRARY_SKILL_IMPLICIT_MODE;
+};
+
+/**
+ * Connectors — the user's MCP connectors, Composio and LobeHub connections and
+ * installed plugins — are opt-in per agent and have two states. The agent's
+ * profile is where one is turned on, so a connector the agent has no entry for
+ * is off there, exactly like a library skill.
+ */
+export const CONNECTOR_IMPLICIT_MODE: AgentPluginMode = 'disabled';
+
+/** The mode the two-state connector switch writes for "on". */
+export const CONNECTOR_ON_MODE: AgentPluginMode = 'auto';
+
+/**
+ * A connector's state for this agent: `'auto'` (on — the model finds it on
+ * demand) or `'disabled'` (off). A `'pinned'` entry written before connectors
+ * lost that state reads as on, so no stored row needs rewriting.
+ */
+export const getConnectorMode = (
+  plugins: AgentPluginEntry[] | undefined,
+  identifier: string,
+): 'auto' | 'disabled' => {
+  const entry = plugins?.find((item) => parsePluginEntry(item).identifier === identifier);
+  if (!entry) return 'disabled';
+  return parsePluginEntry(entry).mode === 'disabled' ? 'disabled' : 'auto';
+};
+
+const getPluginIdsByMode = (
+  plugins: AgentPluginEntry[] | undefined,
+  mode: AgentPluginMode,
+): string[] =>
+  (plugins ?? [])
+    .map((item) => parsePluginEntry(item))
+    .filter((item) => item.mode === mode)
+    .map((item) => item.identifier);
+
+export const getPinnedPluginIds = (plugins: AgentPluginEntry[] | undefined): string[] =>
+  getPluginIdsByMode(plugins, 'pinned');
+
+/**
+ * Identifiers carrying an explicit `{ mode: 'auto' }` entry. Only library
+ * skills persist one (see {@link LIBRARY_SKILL_IMPLICIT_MODE}); for everything
+ * else `'auto'` is the absence of an entry.
+ */
+export const getAutoPluginIds = (plugins: AgentPluginEntry[] | undefined): string[] =>
+  getPluginIdsByMode(plugins, 'auto');
+
+export const getDisabledPluginIds = (plugins: AgentPluginEntry[] | undefined): string[] =>
+  getPluginIdsByMode(plugins, 'disabled');
+
+/**
+ * Every identifier the agent turned on, pinned or `auto`. This is the opt-in
+ * list for the kinds that are off without an entry — library skills and
+ * connectors ({@link CONNECTOR_IMPLICIT_MODE}).
+ */
+export const getOptedInPluginIds = (plugins: AgentPluginEntry[] | undefined): string[] =>
+  (plugins ?? [])
+    .map((item) => parsePluginEntry(item))
+    .filter((item) => item.mode !== 'disabled')
+    .map((item) => item.identifier);
+
+/**
+ * Pinned identifiers — the drop-in replacement for runtime boundaries that
+ * used to read `agentConfig?.plugins ?? []` directly as the enabled-tool
+ * list. Kept as a distinct name from `getPinnedPluginIds` so call sites read
+ * as "what should actually run" rather than "what's pinned".
+ */
+export const getActivePluginIds = (plugins: AgentPluginEntry[] | undefined): string[] =>
+  getPinnedPluginIds(plugins);
+
+/**
+ * Sets `identifier`'s mode, upgrading only that one entry. Every other entry
+ * — including untouched legacy strings — is returned unchanged.
+ *
+ * `implicitMode` is what an identifier absent from `plugins` resolves to —
+ * `'auto'` for everything but a library skill
+ * ({@link LIBRARY_SKILL_IMPLICIT_MODE}). Setting that mode removes any existing
+ * entry instead of persisting a redundant record, which mirrors the
+ * pre-tri-state behavior where unpinning spliced the id out of the array. Every
+ * other mode is written explicitly, so a library skill set to `'auto'` keeps a
+ * `{ identifier, mode: 'auto' }` entry.
+ */
+export const upsertPluginMode = (
+  plugins: AgentPluginEntry[] | undefined,
+  identifier: string,
+  mode: AgentPluginMode,
+  implicitMode: AgentPluginMode = 'auto',
+): AgentPluginEntry[] => {
+  const list = plugins ? [...plugins] : [];
+  const index = list.findIndex((item) => parsePluginEntry(item).identifier === identifier);
+
+  if (mode === implicitMode) {
+    if (index !== -1) list.splice(index, 1);
+    return list;
+  }
+
+  if (index === -1) {
+    list.push({ identifier, mode });
+    return list;
+  }
+
+  const existing = list[index];
+  list[index] =
+    typeof existing === 'string' ? { identifier: existing, mode } : { ...existing, mode };
+
+  return list;
+};
+
+/**
+ * Writes the two-state connector switch. On is an explicit `auto` entry —
+ * without one the connector is off. Off keeps a `disabled` entry rather than
+ * dropping it, so the connector stays listed on the agent and can be turned
+ * back on; removing it from the agent is `upsertPluginMode(…, 'auto')`.
+ */
+export const upsertConnectorEnabled = (
+  plugins: AgentPluginEntry[] | undefined,
+  identifier: string,
+  enabled: boolean,
+): AgentPluginEntry[] =>
+  enabled
+    ? upsertPluginMode(plugins, identifier, CONNECTOR_ON_MODE, CONNECTOR_IMPLICIT_MODE)
+    : upsertPluginMode(plugins, identifier, 'disabled');

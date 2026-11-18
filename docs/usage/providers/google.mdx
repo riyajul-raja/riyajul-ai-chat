@@ -1,0 +1,93 @@
+---
+title: Using Google Gemini API Key in LobeHub
+description: >-
+  This guide will walk you through how to configure and use Google Gemini, a
+  powerful language model developed by Google AI, within LobeHub.
+tags:
+  - Google Gemini
+  - Google AI
+  - API Key
+  - Web UI
+---
+
+# Using Google Gemini in LobeHub
+
+<Image alt={'Using Google Gemini in LobeHub'} cover src={'/blog/assets34400653/9a8dc1d4-152b-415f-a7cd-8f0c8fbb9913.webp'} />
+
+Gemini AI is a suite of large language models (LLMs) developed by Google AI, renowned for its cutting-edge capabilities in multimodal understanding and processing. It is a powerful AI tool designed to handle a wide range of tasks involving various types of data—not just text.
+
+This guide will show you how to use Google Gemini in LobeHub:
+
+<Steps>
+  ### Step 1: Obtain a Google API Key
+
+  - Visit and sign in to [Google AI Studio](https://aistudio.google.com/)
+  - In the "Get API Key" menu, click on "Create API Key"
+
+  <Image alt={'Generate Google Gemini API Key'} inStep src={'/blog/assets34400653/ba3595e3-d9cb-4d0d-b414-8306b16df186.webp'} />
+
+  - Choose an existing project or create a new one to generate your API key
+
+  <Image alt={'Enter API Key Name'} inStep src={'/blog/assets34400653/fa725e49-4c17-4055-82bc-98a31e73fa54.webp'} />
+
+  - Copy the API key from the pop-up dialog
+
+  <Image alt={'Copy API Key'} inStep src={'/blog/assets34400653/28d89add-cb18-4b86-9807-f2a5ed65ceba.webp'} />
+
+  ### Step 2: Configure Google Gemini in LobeHub
+
+  - Open **App Settings → AI Providers**, select **Google**, and enable the provider
+  - Enter the API key. If you use a proxy, enter its proxy URL
+
+  <Image alt={'Enter Google Gemini API Key in LobeHub'} inStep src={'/blog/assets34400653/11442ce4-a615-49c4-937a-ca2ae93dd27c.webp'} />
+
+  - Select **Check** to test the connection
+  - Enable the Gemini models you need, then select one in the Agent settings
+
+  <Image alt={'Select and Use Gemini Model'} inStep src={'/blog/assets34400653/ef9ed1b8-6828-4dd6-b86b-bb0b4fa40619.webp'} />
+
+  <Callout type={'warning'}>
+    You may incur charges from the API provider while using the service. Please refer to Google Gemini’s pricing policy for details.
+  </Callout>
+</Steps>
+
+And that’s it — you’re now ready to use Google Gemini in LobeHub!
+
+## Text to speech (Gemini TTS)
+
+The Google provider also turns text into speech with Gemini TTS. It uses the same API key as the chat models.
+
+### Choose a model and a default voice
+
+- Open **App Settings → AI Providers → Google**. The **TTS** tab of the model list shows the Gemini speech models:
+
+  | Model                          | Notes                                                               |
+  | ------------------------------ | ------------------------------------------------------------------- |
+  | `gemini-3.8-flash-tts`         | Enabled by default. Recommended.                                    |
+  | `gemini-3.8-flash-lite-tts`    | Enabled by default. Lower cost and latency.                         |
+  | `gemini-2.5-flash-preview-tts` | Legacy preview. Google shuts it down on 2026-11-17 at the earliest. |
+  | `gemini-2.5-pro-preview-tts`   | Legacy preview. Google shuts it down on 2026-11-17 at the earliest. |
+
+- Turn a model on or off with its switch.
+
+- To change the voice used when a request names none, select the model's **Configure** button and pick a **Default Voice**. All 30 Gemini prebuilt voices are listed with their style (for example `Kore · Firm`, `Puck · Upbeat`). Leave it empty to use the model default, `Kore`. The setting is saved per model and applies to the LobeHub CLI and the `/api/v1/audio/speech` endpoint.
+
+### Generate speech
+
+```bash
+lh generate tts "Hello from LobeHub" -m gemini-3.8-flash-tts -o hello.mp3
+lh generate tts "你好，欢迎使用 LobeHub。" -m google/gemini-3.8-flash-tts --voice Puck \
+  --instructions "Say it slowly and warmly" -o hello-zh.mp3
+```
+
+- **Voice**: one of the 30 prebuilt voices, for example `Kore`, `Puck`, `Zephyr` or `Charon`. Every voice speaks all supported languages, including Chinese and English.
+- **Style**: Gemini has no numeric speed, pitch or volume. Use `--instructions` to describe pace and tone in natural language, for example "speak slowly in a calm voice". `--speed`, `--pitch`, `--volume` and `--emotion` are rejected for Gemini models.
+- **Format**: Gemini returns 24 kHz, 16-bit mono PCM. LobeHub encodes it to MP3 (24 kHz mono, 40 kbps), which is the only format returned through the CLI and the speech endpoint (`audio/mpeg`).
+- **Length**: one request returns up to about 11 minutes of audio. Split long text into several requests.
+- **Billing**: Gemini TTS bills the input text tokens and the generated audio tokens (about 25 tokens per second of audio). See [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing).
+
+### Troubleshooting
+
+- **"Google API Key is incorrect or empty…"**: no key is set, or Google rejected it. Check the key in **App Settings → AI Providers → Google**, or `GOOGLE_API_KEY` on a self-hosted server.
+- **Rate-limit errors**: the request exceeded the TTS rate limit of your Gemini API tier. Wait and retry, or raise the tier of the Google Cloud project.
+- **Content blocked**: Gemini refused the text for safety reasons. Rephrase the text.

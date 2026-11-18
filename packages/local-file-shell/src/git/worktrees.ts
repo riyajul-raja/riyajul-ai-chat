@@ -1,0 +1,266 @@
+import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { mkdir, realpath } from 'node:fs/promises';
+import path from 'node:path';
+import { promisify } from 'node:util';
+
+import { isInvalidBranchRef, qualifyStartPoint } from './branches';
+import { getGitWorkingTreeStatus } from './info';
+import { isValidOwnerToken, readOwnerMarker, writeOwnerMarker } from './ownerMarker';
+import type {
+  GitAddWorktreeResult,
+  GitRemoveWorktreeResult,
+  GitWorkingTreeStatus,
+  GitWorktreeListItem,
+} from './types';
+
+const execFileAsync = promisify(execFile);
+
+const normalizeBranchRef = (ref: string): string =>
+  ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref;
+
+const safeRealpath = async (target: string): Promise<string> => {
+  try {
+    return await realpath(target);
+  } catch {
+    return path.resolve(target);
+  }
+};
+
+interface ParsedWorktree {
+  bare?: boolean;
+  branch?: string;
+  detached?: boolean;
+  head?: string;
+  locked?: boolean;
+  lockReason?: string;
+  path: string;
+  prunable?: boolean;
+  pruneReason?: string;
+}
+
+export const parseGitWorktreeList = (stdout: string): ParsedWorktree[] => {
+  const records: ParsedWorktree[] = [];
+  let current: ParsedWorktree | undefined;
+
+  for (const token of stdout.split('\0')) {
+    if (!token) {
+      if (current) {
+        records.push(current);
+        current = undefined;
+      }
+      continue;
+    }
+
+    const [key, ...rest] = token.split(' ');
+    const value = rest.join(' ');
+
+    if (key === 'worktree') {
+      if (current) records.push(current);
+      current = { path: value };
+      continue;
+    }
+
+    if (!current) continue;
+
+    switch (key) {
+      case 'HEAD': {
+        current.head = value;
+        break;
+      }
+      case 'bare': {
+        current.bare = true;
+        break;
+      }
+      case 'branch': {
+        current.branch = normalizeBranchRef(value);
+        break;
+      }
+      case 'detached': {
+        current.detached = true;
+        break;
+      }
+      case 'locked': {
+        current.locked = true;
+        current.lockReason = value || undefined;
+        break;
+      }
+      case 'prunable': {
+        current.prunable = true;
+        current.pruneReason = value || undefined;
+        break;
+      }
+    }
+  }
+
+  if (current) records.push(current);
+  return records;
+};
+
+const readStatus = async (worktree: ParsedWorktree): Promise<GitWorkingTreeStatus | undefined> => {
+  if (worktree.bare || worktree.prunable) return undefined;
+  return getGitWorkingTreeStatus(worktree.path);
+};
+
+export const listGitWorktrees = async (dirPath: string): Promise<GitWorktreeListItem[]> => {
+  try {
+    const [{ stdout: rootStdout }, { stdout }] = await Promise.all([
+      execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd: dirPath, timeout: 5000 }),
+      execFileAsync('git', ['worktree', 'list', '--porcelain', '-z'], {
+        cwd: dirPath,
+        timeout: 5000,
+      }),
+    ]);
+
+    const currentRoot = await safeRealpath(rootStdout.trim());
+    const parsed = parseGitWorktreeList(stdout);
+    const statuses = await Promise.all(parsed.map(readStatus));
+
+    return Promise.all(
+      parsed.map(async (worktree, index): Promise<GitWorktreeListItem> => {
+        const worktreePath = await safeRealpath(worktree.path);
+        return {
+          ...worktree,
+          current: worktreePath === currentRoot,
+          path: worktree.path,
+          status: statuses[index],
+        };
+      }),
+    );
+  } catch {
+    return [];
+  }
+};
+
+const findListedWorktree = async (
+  dirPath: string,
+  worktreePath: string,
+): Promise<GitWorktreeListItem | undefined> => {
+  const targetPath = await safeRealpath(worktreePath);
+  const worktrees = await listGitWorktrees(dirPath);
+
+  for (const worktree of worktrees) {
+    if ((await safeRealpath(worktree.path)) === targetPath) return worktree;
+  }
+};
+
+export const removeGitWorktree = async (payload: {
+  path: string;
+  worktreePath: string;
+}): Promise<GitRemoveWorktreeResult> => {
+  const { path: dirPath, worktreePath } = payload;
+  if (!dirPath?.trim()) return { error: 'Working directory is required', success: false };
+  if (!worktreePath?.trim()) return { error: 'Worktree path is required', success: false };
+
+  const worktree = await findListedWorktree(dirPath, worktreePath);
+  if (!worktree) return { error: 'Worktree not found', success: false };
+  if (worktree.current) return { error: 'Cannot remove the current worktree', success: false };
+  if (worktree.bare) return { error: 'Cannot remove the bare worktree', success: false };
+
+  try {
+    await execFileAsync('git', ['worktree', 'remove', worktree.path], {
+      cwd: dirPath,
+      timeout: 30_000,
+    });
+    return { success: true };
+  } catch (error: any) {
+    const stderr: string = (error?.stderr ?? error?.message ?? '').toString().trim();
+    return { error: stderr || 'git worktree remove failed', success: false };
+  }
+};
+
+/**
+ * Add a linked worktree checked out on a fresh branch, mirroring the branch
+ * switcher's "create branch" flow (`git worktree add -b <branch> <path>`). The
+ * new branch forks from `startPoint` when given (echoed back on success, so a
+ * caller can tell an older device that ignored it and forked from HEAD), else
+ * from the repo's current HEAD; the caller supplies the target
+ * directory (`deriveWorktreePath`, under `~/.lobehub/worktrees/`). The missing
+ * parent folders are created first, and an existing target or an unwritable
+ * root is reported as such instead of git's generic failure. Returns the
+ * created path on success so the UI can switch into it.
+ */
+export const addGitWorktree = async (payload: {
+  branch: string;
+  /**
+   * Set when the app creates the worktree for a conversation: written into the
+   * worktree's git admin dir as its creation receipt (`ownedWorktree.ts`), and
+   * echoed back so the caller knows this device recorded it.
+   */
+  ownerToken?: string;
+  path: string;
+  startPoint?: string;
+  worktreePath: string;
+}): Promise<GitAddWorktreeResult> => {
+  const { path: dirPath, branch, ownerToken, startPoint, worktreePath } = payload;
+  if (ownerToken !== undefined && !isValidOwnerToken(ownerToken))
+    return { error: 'Invalid owner token', success: false };
+  if (!dirPath?.trim()) return { error: 'Working directory is required', success: false };
+  if (!branch?.trim()) return { error: 'Branch name is required', success: false };
+  if (!worktreePath?.trim()) return { error: 'Worktree path is required', success: false };
+  if (isInvalidBranchRef(branch))
+    return { error: `Invalid branch name: ${branch}`, success: false };
+  if (startPoint !== undefined && (!startPoint.trim() || isInvalidBranchRef(startPoint)))
+    return { error: `Invalid start point: ${startPoint}`, success: false };
+
+  if (!path.isAbsolute(worktreePath))
+    return { error: `Worktree path must be absolute: ${worktreePath}`, success: false };
+  if (existsSync(worktreePath)) {
+    if (ownerToken) {
+      const existing = await findListedWorktree(dirPath, worktreePath);
+      if (
+        existing?.branch === normalizeBranchRef(branch) &&
+        !existing.prunable &&
+        (await readOwnerMarker(existing.path).catch(() => undefined)) === ownerToken
+      ) {
+        return { ownerToken, startPoint, success: true, worktreePath: existing.path };
+      }
+    }
+    return { error: `Worktree folder already exists: ${worktreePath}`, success: false };
+  }
+
+  const parent = path.dirname(worktreePath);
+  try {
+    await mkdir(parent, { recursive: true });
+  } catch (error: any) {
+    const reason = error?.code ?? error?.message ?? 'unknown error';
+    return { error: `Cannot create worktree folder ${parent}: ${reason}`, success: false };
+  }
+
+  try {
+    await execFileAsync(
+      'git',
+      [
+        'worktree',
+        'add',
+        '-b',
+        branch,
+        worktreePath,
+        ...(startPoint ? [await qualifyStartPoint(dirPath, startPoint)] : []),
+      ],
+      { cwd: dirPath, timeout: 30_000 },
+    );
+    // The receipt is what lets this conversation clean the worktree up later;
+    // without it a later cleanup refuses, so report it as part of the add.
+    if (ownerToken) {
+      try {
+        await writeOwnerMarker(worktreePath, ownerToken);
+      } catch (error: any) {
+        return {
+          error: `Worktree created, but its ownership receipt could not be written: ${error?.message ?? error}`,
+          success: false,
+          worktreePath,
+        };
+      }
+    }
+    return {
+      ...(ownerToken && { ownerToken }),
+      ...(startPoint && { startPoint }),
+      success: true,
+      worktreePath,
+    };
+  } catch (error: any) {
+    const stderr: string = (error?.stderr ?? error?.message ?? '').toString().trim();
+    return { error: stderr || 'git worktree add failed', success: false };
+  }
+};
